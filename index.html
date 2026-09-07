@@ -1,0 +1,667 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pool Seeder</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #14041f; color: #e8e3f2; font: 14px/1.5 system-ui, sans-serif; }
+  main { max-width: 1080px; margin: 0 auto; padding: 24px 16px 80px; }
+  h1 { font-size: 20px; } h1 small { color: #9a8fb5; font-weight: 400; margin-left: 10px; }
+  .warnbox { background: #3a2410; border: 1px solid #8a5a20; border-radius: 10px; padding: 10px 14px; margin: 12px 0; color: #f0c988; }
+  button { background: #3c2a63; color: #efeafd; border: 1px solid #5c4693; border-radius: 8px; padding: 7px 14px; cursor: pointer; font: inherit; }
+  button:hover { background: #4a3579; } button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: #7b67f6; border-color: #7b67f6; color: #fff; }
+  table { border-collapse: collapse; width: 100%; margin-top: 16px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #2c1f45; white-space: nowrap; }
+  th { color: #9a8fb5; font-weight: 500; font-size: 12px; }
+  td.num { font-variant-numeric: tabular-nums; }
+  .ok { color: #6fdc8c; } .bad { color: #f08a8a; } .dim { color: #9a8fb5; }
+  #log { background: #0d0217; border: 1px solid #2c1f45; border-radius: 10px; padding: 12px; margin-top: 20px;
+         white-space: pre-wrap; font: 12px/1.5 ui-monospace, monospace; height: 220px; overflow-y: auto; }
+  #sheetBg { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none; align-items: center; justify-content: center; }
+  #sheetBg.on { display: flex; }
+  #sheet { background: #1d0f33; border: 1px solid #4a3579; border-radius: 14px; padding: 20px 24px; max-width: 460px; width: 92%; }
+  #sheet h2 { margin: 0 0 12px; font-size: 16px; }
+  #sheet .rows div { display: flex; justify-content: space-between; gap: 16px; padding: 4px 0; border-bottom: 1px solid #2c1f45; }
+  #sheet .rows span:first-child { color: #9a8fb5; }
+  .btnrow { display: flex; gap: 10px; margin-top: 16px; justify-content: flex-end; }
+  input[type=text] { background: #0d0217; color: #efeafd; border: 1px solid #4a3579; border-radius: 6px; padding: 5px 8px; width: 90px; font: inherit; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Pool Seeder <small>full-range seeding for the USDC.noble &rarr; allUSDC migration destinations</small></h1>
+  <div class="warnbox">Signs real transactions with real funds. Every action shows a confirmation first; read it.
+    Swaps are routed by SQS when it answers, falling back to a fixed route (transmuter &rarr; deepest USDC.noble pool for
+    the asset); either way the quote and the output floor come from simulating the actual swap, and the sheet shows how far
+    the fill sits below spot. LP adds a full-range position to the destination pool at its <b>current</b> price with zero
+    minimums, so check the shown divergence first.</div>
+  <div style="display:flex; gap:10px; align-items:center; margin: 14px 0;">
+    <button id="connect" class="primary">Connect Keplr</button>
+    <span id="who" class="dim"></span>
+    <button id="refresh" disabled>Refresh</button>
+    <span style="margin-left:auto" class="dim">swap size $<span id="swapUsd">50</span> allUSDC</span>
+  </div>
+  <table>
+    <thead><tr>
+      <th>dest</th><th>pair</th><th>spread</th><th>divergence</th><th>FR&nbsp;LP</th><th>NR&nbsp;LP</th><th>your asset</th><th>your allUSDC</th><th></th><th></th><th></th><th></th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div id="log"></div>
+</main>
+<div id="sheetBg"><div id="sheet"></div></div>
+<script>
+"use strict";
+/* Seeds the allUSDC destination pools of the USDC.noble position-migration map
+   (fe-content cms/position-migrations.json). Per pool: swap $50 of allUSDC into the
+   counterparty asset, then create a full-range concentrated position from the wallet's
+   counterparty + allUSDC balances.
+
+   Signing, protobuf encoding and endpoint handling are lifted from alloyrebalancer
+   (byte-checked there and here by test.mjs). Local use only; serve via serve.cmd. */
+
+const ALLUSDC = "factory/osmo147h5x9pcj7lm0cttlaefx6sqq5vdfnmwfcqxkmjd7exqm9gc7grqhr75m0/alloyed/allUSDC";
+const USDC_NOBLE = "ibc/498A0751C798A0D9A389AA3691123DADA57DAA4FE165D5C75894505B876BA6E4";
+const SWAP_IN = "50000000";              // $50 of allUSDC (6 decimals)
+const MIN_TICK = -108000000n, MAX_TICK = 342000000n;
+const TICK_SPACING = "100";
+const TRANSMUTER_POOL = "3497";          // allUSDC transmuter: USDC.noble <-> allUSDC at 1:1, zero spread
+const SQS = "https://sqs.osmosis.zone";  // tried first for swap routing; the fixed route is the fallback
+const OSMO_REST = ["https://lcd.osmosis.zone", "https://osmosis-api.polkachu.com", "https://rest.lavenderfive.com:443/osmosis"];
+const OSMO_MIN_GAS_PRICE = 0.03;
+const CHAIN_ID = "osmosis-1";
+
+/* Destination pools and their expected parameters, from the committed migration map.
+   The chain is still authoritative: every LP add re-reads the pool and refuses on any
+   mismatch of denoms, spread factor or tick spacing. */
+const PAIRS = [
+  { from: 1926, to: 3501, sym: "USDY", dec: 18, spread: "0.000100000000000000", denom: "ibc/23104D411A6EB6031FA92FB75F227422B84989969E91DCAD56A535DD7FF0A373" },
+  { from: 1943, to: 3502, via: 2321, sym: "BTC", dec: 8, spread: "0.000100000000000000", denom: "factory/osmo1z6r6qdknhgsc0zeracktgpcxf43j6sekq07nw8sxduc9lg0qjjlqfu25e3/alloyed/allBTC" },
+  { from: 1942, to: 3503, via: 2321, sym: "BTC", dec: 8, spread: "0.000500000000000000", denom: "factory/osmo1z6r6qdknhgsc0zeracktgpcxf43j6sekq07nw8sxduc9lg0qjjlqfu25e3/alloyed/allBTC" },
+  { from: 2321, to: 3504, sym: "BTC", dec: 8, spread: "0.001000000000000000", denom: "factory/osmo1z6r6qdknhgsc0zeracktgpcxf43j6sekq07nw8sxduc9lg0qjjlqfu25e3/alloyed/allBTC" },
+  { from: 1251, to: 3505, sym: "ATOM", dec: 6, spread: "0.002000000000000000", denom: "ibc/27394FB092D2ECCD56123C74F36E4C1F926001CEADA9CA97EA622B25F41E5EB2" },
+  { from: 1880, to: 3508, sym: "USDT", dec: 6, spread: "0.000500000000000000", denom: "factory/osmo1em6xs47hd82806f5cxgyufguxrrc7l0aqx7nzzptjuqgswczk8csavdxek/alloyed/allUSDT" },
+  { from: 1301, to: 3509, sym: "AKT", dec: 6, spread: "0.002000000000000000", denom: "ibc/1480B8FD20AD5FCAE81EA87584D269547DD4D436843C1D20F15E00EB64743EF4" },
+  { from: 1220, to: 3510, sym: "USDT.kava", dec: 6, spread: "0.000100000000000000", denom: "ibc/4ABBEF4C8926DDDB320AE5188CFD63267ABBCEFC0583E4AE05D6E5AA2401DDAB" },
+  { from: 1947, to: 3511, via: 1948, sym: "ETH", dec: 18, spread: "0.002000000000000000", denom: "factory/osmo1k6c8jln7ejuqwtqmay3yvzrg3kueaczl96pk067ldg8u835w0yhsw27twm/alloyed/allETH" },
+  { from: 1948, to: 3512, sym: "ETH", dec: 18, spread: "0.000500000000000000", denom: "factory/osmo1k6c8jln7ejuqwtqmay3yvzrg3kueaczl96pk067ldg8u835w0yhsw27twm/alloyed/allETH" },
+  { from: 1464, to: 3513, sym: "OSMO", dec: 6, spread: "0.000100000000000000", denom: "uosmo" },
+  { from: 1253, to: 3517, sym: "nBTC", dec: 14, spread: "0.002000000000000000", denom: "ibc/75345531D87BD90BF108BE7240BD721CB2CB0A1F16D4EBA71B09EC3C43E15C8F" },
+  { from: 2444, to: 3534, sym: "VERONA", dec: 6, spread: "0.002000000000000000", denom: "ibc/2E3784772E70F7B3A638BA88F65C8BE125D3CDB6E28C6AABC51098C94F5E16A5" },
+  { from: 2907, to: 3535, sym: "BABY", dec: 6, spread: "0.002000000000000000", denom: "ibc/EC3A4ACBA1CFBEE698472D3563B70985AEA5A7144C319B61B3EBDFB57B5E1535" },
+  { from: 1319, to: 3536, sym: "INJ", dec: 18, spread: "0.002000000000000000", denom: "ibc/64BA6E31FE887D66C6F8F31C7B1A80C7CA179239677B4088BB55F5EA07DBE273" },
+  { from: 3220, to: 3538, sym: "PHOTON", dec: 6, spread: "0.010000000000000000", denom: "ibc/D6E02C5AE8A37FC2E3AB1FC8AC168878ADB870549383DFFEA9FD020C234520A7" },
+  { from: 1247, to: 3540, sym: "TIA", dec: 6, spread: "0.000500000000000000", denom: "ibc/D79E7D83AB399BFFF93433E54FAA480C191248FC556924A2A8351AE2638B3877" },
+  { from: 2178, to: 3547, sym: "BERNESE", dec: 6, spread: "0.025000000000000000", denom: "factory/osmo1s6ht8qrm8x0eg8xag5x3ckx9mse9g4se248yss/BERNESE" },
+  { from: 3335, to: 3550, sym: "NYM", dec: 6, spread: "0.001000000000000000", denom: "ibc/37CB3078432510EE57B9AFA8DBE028B33AE3280A144826FEAC5F2334CF2C5539" },
+  { from: 3085, to: 3555, sym: "NRIDE", dec: 6, spread: "0.001000000000000000", denom: "ibc/E750D31033DC1CF4A044C3AA0A8117401316DC918FBEBC4E3D34F91B09D5F54C" },
+];
+
+/* ---------------- small helpers (from alloyrebalancer) ---------------- */
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+function log(...a) {
+  console.log("[seeder]", ...a);
+  const el = $("log"); el.textContent += new Date().toISOString().slice(11,19) + "  " + a.map(x => typeof x === "string" ? x : JSON.stringify(x)).join(" ") + "\n";
+  el.scrollTop = el.scrollHeight;
+}
+function fmtUnits(raw, dec) {
+  const n = BigInt(raw); const s = n.toString().padStart(dec + 1, "0");
+  const ip = s.slice(0, -dec).replace(/\B(?=(\d{3})+(?!\d))/g, ","), fp = s.slice(-dec).replace(/0+$/, "");
+  return fp ? `${ip}.${fp}` : ip;
+}
+async function jget(url, opts) {
+  const r = await fetch(url, opts); const t = await r.text();
+  let j; try { j = JSON.parse(t); } catch { throw new Error(`${r.status} from ${url}: ${t.slice(0, 120)}`); }
+  if (!r.ok) throw new Error(j.message || j.error || `${r.status} from ${url}`);
+  return j;
+}
+let PROVEN = null;
+async function proveEndpoints() {
+  if (PROVEN) return PROVEN;
+  const ok = [];
+  await Promise.all(OSMO_REST.map(async ep => {
+    try { const j = await jget(ep + "/cosmos/base/tendermint/v1beta1/node_info"); if (j.default_node_info?.network === CHAIN_ID) ok.push(ep); }
+    catch (e) { log(`endpoint ${ep} skipped: ${e.message}`); }
+  }));
+  if (!ok.length) throw new Error("no REST endpoint proved chain id " + CHAIN_ID);
+  PROVEN = OSMO_REST.filter(e => ok.includes(e));
+  return PROVEN;
+}
+async function lcdGet(path) {
+  const eps = await proveEndpoints(); let last;
+  for (const ep of eps) { try { return await jget(ep + path); } catch (e) { last = e; } }
+  throw last;
+}
+async function lcdPost(ep, path, body) { return jget(ep + path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }); }
+async function bankBalance(addr, denom) {
+  const j = await lcdGet(`/cosmos/bank/v1beta1/balances/${addr}/by_denom?denom=${encodeURIComponent(denom)}`);
+  return BigInt(j.balance?.amount || "0");
+}
+async function getAccount(addr) {
+  const j = await lcdGet(`/cosmos/auth/v1beta1/accounts/${addr}`);
+  if (!j.account) throw new Error(`account ${addr} not found (never funded?)`);
+  let a = j.account; for (let i = 0; i < 4 && a.account_number === undefined; i++) a = a.base_account || a.base_vesting_account || {};
+  if (a.account_number === undefined) throw new Error("unrecognised account shape");
+  return { accountNumber: a.account_number, sequence: a.sequence ?? "0" };
+}
+async function gasPriceOf() {
+  try { const j = await lcdGet("/osmosis/txfees/v1beta1/cur_eip_base_fee"); const b = Number(j.base_fee); if (b > 0) return Math.max(b, OSMO_MIN_GAS_PRICE) * 1.25; } catch {}
+  return OSMO_MIN_GAS_PRICE * 1.5;
+}
+
+/* ---------------- protobuf (from alloyrebalancer; byte-checked by test.mjs) ---------------- */
+const te = new TextEncoder();
+const U64_MAX = 18446744073709551615n;
+function uint64Value(v, label = "value") {
+  const s = String(v); if (!/^\d+$/.test(s)) throw new RangeError(`${label} must be an unsigned whole number.`);
+  const n = BigInt(s); if (n > U64_MAX) throw new RangeError(`${label} exceeds uint64.`); return n;
+}
+function varint(n){ n=BigInt(n); if(n<0n)throw new RangeError("varint cannot encode a negative value"); const o=[]; for(;;){ let b=Number(n & 0x7Fn); n >>= 7n; if(n){o.push(b|0x80)} else {o.push(b); break} } return Uint8Array.from(o); }
+function cat(...a){ const t=a.reduce((s,x)=>s+x.length,0); const o=new Uint8Array(t); let i=0; for(const x of a){o.set(x,i); i+=x.length} return o; }
+function tag(f,w){ return varint((f<<3)|w); }
+function bytesF(f,b){ return cat(tag(f,2), varint(b.length), b); }
+function strF(f,s){ return bytesF(f, te.encode(s)); }
+function u64F(f,v){ return cat(tag(f,0), varint(uint64Value(v))); }
+/* proto int64: negatives go over the wire as their 64-bit two's complement (a 10-byte varint). */
+function i64F(f,v){ const n=BigInt(v); if(n>9223372036854775807n||n< -9223372036854775808n)throw new RangeError("exceeds int64"); return cat(tag(f,0), varint(BigInt.asUintN(64,n))); }
+const Any  = (u,v) => { const a = cat(strF(1,u), bytesF(2,v)); if (v.amino) a.amino = v.amino; return a; };
+const sortedJson = x => JSON.stringify(x, (kk, v) => v && typeof v === "object" && !Array.isArray(v) ? Object.keys(v).sort().reduce((o, q) => (o[q] = v[q], o), {}) : v);
+const Coin = (d,a) => cat(strF(1,d), strF(2,a));
+function TxBody(anys, memo){ let b=new Uint8Array(0); for(const a of anys) b=cat(b,bytesF(1,a)); if(memo) b=cat(b,strF(2,memo)); return b; }
+function Fee(amts,gas){ let f=new Uint8Array(0); for(const c of amts) f=cat(f,bytesF(1,Coin(c.denom,c.amount))); return cat(f,u64F(2,gas)); }
+function SignerInfo(pkAny,mode,seq){ let s=new Uint8Array(0); if(pkAny)s=cat(s,bytesF(1,pkAny)); s=cat(s,bytesF(2,bytesF(1,u64F(1,mode)))); if(BigInt(seq)!==0n)s=cat(s,u64F(3,seq)); return s; }
+function AuthInfo(sis,fee){ let a=new Uint8Array(0); for(const si of sis) a=cat(a,bytesF(1,si)); return cat(a,bytesF(2,fee)); }
+function TxRaw(body,ai,sigs){ let t=cat(bytesF(1,body),bytesF(2,ai)); for(const s of sigs) t=cat(t,bytesF(3,s)); return t; }
+const b64   = u => btoa(String.fromCharCode(...u));
+const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+async function txHashOf(raw) { const h = await crypto.subtle.digest("SHA-256", raw); return Array.from(new Uint8Array(h)).map(b=>b.toString(16).padStart(2,"0")).join("").toUpperCase(); }
+
+/* osmosis.poolmanager MsgSwapExactAmountIn (from alloyrebalancer, byte-checked there). */
+function SwapAmountInRoute(p){ let r=new Uint8Array(0); if(BigInt(p.poolId)!==0n) r=cat(r,u64F(1,p.poolId)); if(p.tokenOutDenom) r=cat(r,strF(2,p.tokenOutDenom)); return r; }
+function MsgSwapExactAmountIn(p){
+  let m = strF(1,p.sender);
+  for (const r of p.routes) m = cat(m, bytesF(2, SwapAmountInRoute(r)));
+  m = cat(m, bytesF(3, Coin(p.tokenIn.denom, p.tokenIn.amount)));
+  m = cat(m, strF(4, p.tokenOutMinAmount));
+  m.amino = { type: "osmosis/poolmanager/swap-exact-amount-in", value: { sender: p.sender,
+    routes: p.routes.map(r => ({ pool_id: String(r.poolId), token_out_denom: r.tokenOutDenom })),
+    token_in: { denom: p.tokenIn.denom, amount: String(p.tokenIn.amount) }, token_out_min_amount: String(p.tokenOutMinAmount) } };
+  return m;
+}
+/* osmosis.concentratedliquidity MsgCreatePosition: pool_id=1 uint64, sender=2, lower_tick=3 int64,
+   upper_tick=4 int64, tokens_provided=5 repeated Coin, token_min_amount0=6, token_min_amount1=7.
+   Field numbers from the chain's tx.proto; byte-checked against proto-codecs by test.mjs. */
+function MsgCreatePosition(p){
+  let m = cat(u64F(1,p.poolId), strF(2,p.sender), i64F(3,p.lowerTick), i64F(4,p.upperTick));
+  for (const c of p.tokensProvided) m = cat(m, bytesF(5, Coin(c.denom, c.amount)));
+  m = cat(m, strF(6, p.tokenMinAmount0), strF(7, p.tokenMinAmount1));
+  m.amino = { type: "osmosis/cl-create-position", value: { pool_id: String(p.poolId), sender: p.sender,
+    lower_tick: String(p.lowerTick), upper_tick: String(p.upperTick),
+    tokens_provided: p.tokensProvided.map(c => ({ denom: c.denom, amount: String(c.amount) })),
+    token_min_amount0: String(p.tokenMinAmount0), token_min_amount1: String(p.tokenMinAmount1) } };
+  return m;
+}
+
+/* Simulate messages without signing; returns the raw simulation (gas + events). */
+async function simulateMsgs(signer, anys) {
+  const eps = await proveEndpoints();
+  const k = await window.keplr.getKey(CHAIN_ID);
+  if (k.bech32Address !== signer) throw new Error(`Keplr's account is ${k.bech32Address}, the message was built for ${signer}`);
+  const acc = await getAccount(signer);
+  const pkAny = Any("/cosmos.crypto.secp256k1.PubKey", bytesF(1, k.pubKey));
+  const body = TxBody(anys, "");
+  const simAI = AuthInfo([SignerInfo(pkAny, 1, acc.sequence)], Fee([{ denom: "uosmo", amount: "0" }], "800000"));
+  let last;
+  for (const ep of eps) {
+    try { return await lcdPost(ep, "/cosmos/tx/v1beta1/simulate", { tx_bytes: b64(TxRaw(body, simAI, [new Uint8Array(65)])) }); }
+    catch (e) { last = e; if (/insufficient|invalid|unauthorized|not found|failed to execute|slippage|min|ran out/i.test(e.message)) throw e; }
+  }
+  throw last ?? new Error("simulation failed on every endpoint");
+}
+/* The amount of `denom` the swap actually produced in a simulation, read from the last
+   token_swapped event (the final hop). Attribute keys may arrive base64-encoded. */
+/* An event attribute by name, whether the node returns attributes plain (SDK 0.50)
+   or base64-encoded (older gateways). Detection keys off the attribute KEY: names
+   like "tokens_out" contain "_", which no base64 string can, so a plain key is
+   unambiguous. Never guess per-VALUE: a plain "1234ibc/HASH" is entirely base64
+   alphabet and decodes to garbage whenever its length is a multiple of 4. */
+function eventAttr(attrs, name) {
+  const plain = attrs.find(at => at.key === name);
+  if (plain) return plain.value;
+  const enc = attrs.find(at => { try { return atob(at.key) === name; } catch { return false; } });
+  if (enc) { try { return atob(enc.value); } catch { return undefined; } }
+  return undefined;
+}
+function swapOutOfSim(sim, denom) {
+  const swaps = (sim.result?.events || []).filter(e => e.type === "token_swapped");
+  if (!swaps.length) throw new Error("simulation produced no token_swapped event");
+  const v = eventAttr(swaps[swaps.length - 1].attributes || [], "tokens_out");
+  if (v === undefined) throw new Error("token_swapped event has no tokens_out attribute");
+  const m = /^(\d+)(.+)$/.exec(v);
+  if (!m || m[2] !== denom) throw new Error(`unexpected tokens_out ${v}`);
+  return BigInt(m[1]);
+}
+
+/* osmosis.concentratedliquidity MsgWithdrawPosition: position_id=1 uint64, sender=2,
+   liquidity_amount=3 (LegacyDec: the 10^18-scaled integer string goes over the wire;
+   the amino JSON carries the 18-decimal form). Byte-checked against proto-codecs. */
+function MsgWithdrawPosition(p){
+  const m = cat(u64F(1,p.positionId), strF(2,p.sender), strF(3,p.liquidityAtomics));
+  const whole = BigInt(p.liquidityAtomics);
+  const aminoDec = (whole / 10n**18n).toString() + "." + (whole % 10n**18n).toString().padStart(18,"0");
+  m.amino = { type: "osmosis/cl-withdraw-position", value: { position_id: String(p.positionId), sender: p.sender, liquidity_amount: aminoDec } };
+  return m;
+}
+
+/* ---------------- tick math ----------------
+   Osmosis CL geometric ticks with exponentAtPriceOne = -6: nine million ticks per decade,
+   each adding 10^(e-6) within the decade starting at 10^e. Raw (base-unit) price in, tick out.
+   Verified against a live pool: 3501 at price 1.1379e-12 sits at tick -107862100 on chain. */
+function priceToTick(p){
+  if (!(p > 0)) throw new Error("price must be positive");
+  const e = Math.floor(Math.log10(p));
+  return Math.round(e * 9e6 + p * 10 ** (6 - e) - 1e6);
+}
+const snapDown = t => { const v = Math.floor(t / 100) * 100; return BigInt(Math.max(v, Number(MIN_TICK))); };
+const snapUp   = t => { const v = Math.ceil(t / 100) * 100;  return BigInt(Math.min(v, Number(MAX_TICK))); };
+/* "123.456000000000000000" (LCD LegacyDec) -> 10^18-scaled BigInt */
+function decAtomics(d){ const [i, f = ""] = String(d).split("."); return BigInt(i) * 10n**18n + BigInt((f + "0".repeat(18)).slice(0, 18)); }
+
+/* Amounts a simulated withdraw paid out, from the withdraw_position event. */
+function withdrawOutOfSim(sim) {
+  const ev = (sim.result?.events || []).filter(e => e.type === "withdraw_position").pop();
+  if (!ev) throw new Error("simulation produced no withdraw_position event");
+  const get = k => (eventAttr(ev.attributes || [], k) ?? "0").replace(/^-/, "");
+  return { amount0: BigInt(get("amount0") || "0"), amount1: BigInt(get("amount1") || "0") };
+}
+
+/* ---------------- sign + broadcast (Osmosis-only cut of alloyrebalancer's) ---------------- */
+async function signAndBroadcast(signer, anys) {
+  const eps = await proveEndpoints();
+  const k = await window.keplr.getKey(CHAIN_ID);
+  if (k.bech32Address !== signer) throw new Error(`Keplr's account is ${k.bech32Address}, the message was built for ${signer}`);
+  const acc = await getAccount(signer);
+  const pkAny = Any("/cosmos.crypto.secp256k1.PubKey", bytesF(1, k.pubKey));
+  const body = TxBody(anys, "");
+  const simAI = AuthInfo([SignerInfo(pkAny, 1, acc.sequence)], Fee([{ denom: "uosmo", amount: "0" }], "800000"));
+  let sim, simEp;
+  for (const ep of eps) { try { sim = await lcdPost(ep, "/cosmos/tx/v1beta1/simulate", { tx_bytes: b64(TxRaw(body, simAI, [new Uint8Array(65)])) }); simEp = ep; break; }
+    catch (e) { log(`simulate on ${ep} failed: ${e.message}`); if (/insufficient|invalid|unauthorized|not found|failed to execute|slippage|min/i.test(e.message)) throw e; } }
+  if (!sim) throw new Error("simulation failed on every endpoint");
+  const used = Number(sim.gas_info?.gas_used || 0); if (!used) throw new Error("node returned no gas_used");
+  const gas = Math.ceil(used * 1.4), fee = String(Math.ceil(gas * await gasPriceOf()));
+  log(`gas ${gas}, fee ${fmtUnits(fee, 6)} OSMO`);
+  let raw;
+  if (k.isNanoLedger) {
+    const aminoMsgs = anys.map(a => { if (!a.amino) throw new Error("no amino form; cannot sign with a Ledger"); return a.amino; });
+    log("confirm on the Ledger (amino)");
+    const s = await window.keplr.signAmino(CHAIN_ID, signer, { chain_id: CHAIN_ID, account_number: String(acc.accountNumber), sequence: String(acc.sequence),
+      fee: { amount: [{ denom: "uosmo", amount: fee }], gas: String(gas) }, msgs: aminoMsgs, memo: "" });
+    if (sortedJson(s.signed.msgs) !== sortedJson(aminoMsgs) || s.signed.memo) throw new Error("the wallet altered the messages or memo while signing; refusing to broadcast");
+    raw = TxRaw(body, AuthInfo([SignerInfo(pkAny, 127, s.signed.sequence)], Fee(s.signed.fee.amount, s.signed.fee.gas)), [unb64(s.signature.signature)]);
+  } else {
+    const authInfo = AuthInfo([SignerInfo(pkAny, 1, acc.sequence)], Fee([{ denom: "uosmo", amount: fee }], String(gas)));
+    const signed = await window.keplr.signDirect(CHAIN_ID, signer, { bodyBytes: body, authInfoBytes: authInfo, chainId: CHAIN_ID, accountNumber: String(acc.accountNumber) });
+    const bb = signed.signed?.bodyBytes ? new Uint8Array(signed.signed.bodyBytes) : body;
+    const ab = signed.signed?.authInfoBytes ? new Uint8Array(signed.signed.authInfoBytes) : authInfo;
+    raw = TxRaw(bb, ab, [unb64(signed.signature.signature)]);
+  }
+  const hash = await txHashOf(raw);
+  log(`broadcasting ${hash} via ${simEp}`);
+  const res = await lcdPost(simEp, "/cosmos/tx/v1beta1/txs", { tx_bytes: b64(raw), mode: "BROADCAST_MODE_SYNC" });
+  const tr = res.tx_response || {};
+  if (Number(tr.code) !== 0) throw new Error(`rejected (code ${tr.code}): ${tr.raw_log || tr.log || "no log"}`);
+  for (let i = 0; i < 40; i++) {
+    await sleep(3000);
+    try { const q = await jget(`${simEp}/cosmos/tx/v1beta1/txs/${hash}`); if (q.tx_response) { if (Number(q.tx_response.code) !== 0) throw new Error(`failed in block: ${q.tx_response.raw_log}`); return hash; } }
+    catch (e) { if (/failed in block/.test(e.message)) throw e; }
+  }
+  throw new Error(`tx ${hash} accepted but not seen in a block after 2 minutes; check an explorer`);
+}
+
+/* ---------------- confirmation sheet ---------------- */
+function confirmSheet({ title, rows, warn }) {
+  return new Promise(resolve => {
+    $("sheet").innerHTML = `<h2>${esc(title)}</h2><div class="rows">${rows.map(([k, v]) => `<div><span>${esc(k)}</span><span>${esc(v)}</span></div>`).join("")}</div>
+      ${warn ? `<div class="warnbox">${esc(warn)}</div>` : ""}
+      <div class="btnrow"><button id="shOk" class="primary">Sign in Keplr</button><button id="shNo">Cancel</button></div>`;
+    $("sheetBg").classList.add("on");
+    const done = v => { $("sheetBg").classList.remove("on"); resolve(v); };
+    $("shOk").onclick = () => done(true); $("shNo").onclick = () => done(false);
+  });
+}
+
+/* ---------------- pool state ---------------- */
+async function clPool(id) {
+  const j = await lcdGet(`/osmosis/poolmanager/v1beta1/pools/${id}`);
+  const p = j.pool;
+  if (p?.["@type"] !== "/osmosis.concentratedliquidity.v1beta1.Pool" || !p.current_sqrt_price)
+    throw new Error(`pool ${id} is not a concentrated pool`);
+  return p;
+}
+/* The connected wallet's positions in this pool: the full-range one (or null) and
+   whether any narrower position exists alongside it. */
+async function poolPositions(addr, poolId) {
+  const j = await lcdGet(`/osmosis/concentratedliquidity/v1beta1/positions/${addr}?pool_id=${poolId}&pagination.limit=100`);
+  const isFR = q => String(q.lower_tick) === MIN_TICK.toString() && String(q.upper_tick) === MAX_TICK.toString();
+  const all = (j.positions || []).map(x => x.position);
+  const hit = all.find(isFR);
+  return {
+    fr: hit ? { id: hit.position_id, liquidity: hit.liquidity } : null,
+    narrow: all.some(q => !isFR(q)),
+  };
+}
+
+/* divergence in percent between two pools of the same pair; decimals cancel in the ratio */
+function divergencePct(fromSqrt, toSqrt) {
+  const a = Number(fromSqrt) ** 2, b = Number(toSqrt) ** 2;
+  if (!(a > 0)) return NaN;
+  return Math.abs(b - a) / a * 100;
+}
+
+/* ---------------- actions ---------------- */
+let ADDR = null;
+const STATE = {};   // per dest pool id: { divergence, assetBal, usdcBal }
+
+/* Best swap route for $50 allUSDC -> asset. SQS first (it can cross deeper markets than
+   any fixed two-hop, which matters for thin assets like nBTC); on any failure - the
+   endpoint is bot-gated and sometimes 403s - fall back to the fixed, auditable route:
+   transmuter (1:1) then the deepest USDC.noble pool for the asset. Either way the route
+   is only a path; the simulation that follows is the authoritative quote. */
+async function bestRoute(pair) {
+  const viaId = pair.via ?? pair.from;
+  try {
+    const q = await jget(`${SQS}/router/quote?tokenIn=${encodeURIComponent(SWAP_IN + ALLUSDC)}&tokenOutDenom=${encodeURIComponent(pair.denom)}&singleRoute=true`);
+    const hops = q.route?.[0]?.pools;
+    if (!hops?.length) throw new Error("no route in response");
+    if (hops.some(h => String(h.id) === String(pair.to))) throw new Error(`route crosses the destination pool ${pair.to}`);
+    if (hops[hops.length - 1].token_out_denom !== pair.denom) throw new Error("route does not end in the expected asset");
+    return { source: "SQS", routes: hops.map(h => ({ poolId: String(h.id), tokenOutDenom: h.token_out_denom })) };
+  } catch (e) {
+    log(`SQS route unavailable (${e.message}); using the fixed route via pool ${viaId}`);
+    return { source: `fixed via ${viaId}`, routes: [
+      { poolId: TRANSMUTER_POOL, tokenOutDenom: USDC_NOBLE },
+      { poolId: String(viaId), tokenOutDenom: pair.denom },
+    ]};
+  }
+}
+async function doSwap(pair, btn) {
+  btn.disabled = true;
+  try {
+    /* The quote comes from simulating the actual swap - a spot-price estimate misquotes
+       thin pools badly (pool 1253 filled at 31% of spot) - and the minimum is set 1.5%
+       under the simulated fill, so only inter-block drift can move it. */
+    const viaId = pair.via ?? pair.from;
+    const src = await clPool(viaId);
+    if (src.token0 !== pair.denom || src.token1 !== USDC_NOBLE)
+      throw new Error(`reference pool ${viaId} is not ${pair.sym}/USDC.noble as expected; refusing`);
+    const spot = Number(src.current_sqrt_price) ** 2;   // raw USDC.noble per raw asset, for the impact display
+    const { source, routes } = await bestRoute(pair);
+    const mkMsg = minOut => Any("/osmosis.poolmanager.v1beta1.MsgSwapExactAmountIn",
+      MsgSwapExactAmountIn({ sender: ADDR, routes, tokenIn: { denom: ALLUSDC, amount: SWAP_IN }, tokenOutMinAmount: minOut }));
+
+    log(`simulating ${pair.sym} swap (${source}) for a real quote...`);
+    const sim = await simulateMsgs(ADDR, [mkMsg("1")]);
+    const simOut = swapOutOfSim(sim, pair.denom);
+    if (simOut <= 0n) throw new Error("simulated output is zero");
+    const spotOut = spot > 0 ? BigInt(Math.floor(Number(SWAP_IN) / spot)) : 0n;
+    const impactPct = spotOut > 0n ? (1 - Number(simOut) / Number(spotOut)) * 100 : NaN;
+    const minOut = (simOut * (10000n - 150n)) / 10000n;   // 1.5% under the simulated fill
+
+    const ok = await confirmSheet({ title: `Swap $50 allUSDC → ${pair.sym}`, rows: [
+      ["route", `${source}: ${routes.map(r => r.poolId).join(" → ")}`],
+      ["in", `${fmtUnits(SWAP_IN, 6)} allUSDC`],
+      ["simulated out", `${fmtUnits(simOut.toString(), pair.dec)} ${pair.sym}`],
+      ["vs spot price", isNaN(impactPct) ? "n/a" : impactPct.toFixed(2) + "% worse (spread + impact)"],
+      ["minimum out", `${fmtUnits(minOut.toString(), pair.dec)} ${pair.sym}`],
+    ], warn: impactPct > 5 ? `This fill is ${impactPct.toFixed(1)}% below spot: the route's in-range liquidity is thin. Consider acquiring ${pair.sym} another way instead of taking this.` : undefined });
+    if (!ok) return;
+
+    const hash = await signAndBroadcast(ADDR, [mkMsg(minOut.toString())]);
+    log(`swap landed: ${hash}`);
+    await sleep(4000);   // other LCD nodes lag the confirming one by a block or two
+    await refreshRow(pair);
+  } catch (e) { log(`swap ${pair.sym}: ${e.message}`); }
+  finally { btn.disabled = false; }
+}
+
+async function doAddLp(pair, btn) {
+  btn.disabled = true;
+  try {
+    /* the chain is authoritative: re-read the pool and refuse on any parameter mismatch */
+    const p = await clPool(pair.to);
+    const denoms = [p.token0, p.token1];
+    if (!denoms.includes(ALLUSDC) || !denoms.includes(pair.denom)) throw new Error(`pool ${pair.to} denoms are not ${pair.sym}/allUSDC; refusing`);
+    if (p.spread_factor !== pair.spread) throw new Error(`pool ${pair.to} spread ${p.spread_factor} does not match expected ${pair.spread}; refusing`);
+    if (String(p.tick_spacing) !== TICK_SPACING) throw new Error(`pool ${pair.to} tick spacing ${p.tick_spacing} is not ${TICK_SPACING}; refusing`);
+
+    const src = await clPool(pair.from);
+    const div = divergencePct(src.current_sqrt_price, p.current_sqrt_price);
+
+    const assetBal = await bankBalance(ADDR, pair.denom);
+    const usdcBal = await bankBalance(ADDR, ALLUSDC);
+    if (assetBal === 0n) throw new Error(`no ${pair.sym} in the wallet; swap first`);
+    if (usdcBal === 0n) throw new Error("no allUSDC in the wallet");
+    const usdcIn = usdcBal < 50000000n ? usdcBal : 50000000n;   // up to $50 of allUSDC alongside the asset
+
+    /* Cap the asset side at ~$55, valued at the source pool's spot price (USDC.noble ~ $1),
+       so a wallet already holding this asset never provides its whole balance. */
+    const srcPrice = Number(src.current_sqrt_price) ** 2;   // raw USDC.noble per raw asset
+    if (!(srcPrice > 0)) throw new Error(`source pool ${pair.from} has no usable price to value the cap`);
+    const assetCap = BigInt(Math.floor(55000000 / srcPrice));
+    const assetIn = assetBal < assetCap ? assetBal : assetCap;
+    if (assetIn <= 0n) throw new Error("asset amount after the cap is zero");
+
+    /* denom-sorted, as the chain requires */
+    const coins = [{ denom: pair.denom, amount: assetIn.toString() }, { denom: ALLUSDC, amount: usdcIn.toString() }]
+      .sort((a, b) => a.denom.localeCompare(b.denom));
+
+    const ok = await confirmSheet({ title: `Full-range LP into pool ${pair.to} (${pair.sym}/allUSDC)`, rows: [
+      ["provide", `${fmtUnits(assetIn.toString(), pair.dec)} ${pair.sym}${assetIn < assetBal ? " (capped at ~$55)" : ""}`],
+      ["and up to", `${fmtUnits(usdcIn.toString(), 6)} allUSDC`],
+      ["range", "full (min tick to max tick)"],
+      ["pool price vs source", isNaN(div) ? "n/a" : div.toFixed(3) + "% divergence"],
+      ["minimums", "0 / 0 (you are the depth in this pool)"],
+    ], warn: div > 0.5 ? `The destination is ${div.toFixed(2)}% off the source pool's price. A full-range add at this price does NOT fix the divergence; the pair stays blocked for migration until the price aligns.` : undefined });
+    if (!ok) return;
+
+    const msg = Any("/osmosis.concentratedliquidity.v1beta1.MsgCreatePosition",
+      MsgCreatePosition({ poolId: String(pair.to), sender: ADDR, lowerTick: MIN_TICK, upperTick: MAX_TICK,
+        tokensProvided: coins, tokenMinAmount0: "0", tokenMinAmount1: "0" }));
+    const hash = await signAndBroadcast(ADDR, [msg]);
+    log(`LP landed in ${pair.to}: ${hash}`);
+    await sleep(4000);   // other LCD nodes lag the confirming one by a block or two
+    await refreshRow(pair);
+  } catch (e) { log(`LP ${pair.sym}: ${e.message}`); }
+  finally { btn.disabled = false; }
+}
+
+async function doAlign(pair, btn) {
+  btn.disabled = true;
+  try {
+    /* Move the destination pool's price onto the source's with one swap inside the
+       destination. The trade size comes from the pool's in-range liquidity L:
+       pushing the price up consumes token1 (allUSDC), dy = L*(sqrtTarget - sqrtCurrent);
+       pushing it down consumes token0 (the asset), dx = L*(1/sqrtTarget - 1/sqrtCurrent).
+       The input is grossed up for the spread (taken from tokenIn before the swap math),
+       so the landing point is approximate: refresh and repeat if a residual remains. */
+    const [dst, src] = await Promise.all([clPool(pair.to), clPool(pair.from)]);
+    if (![dst.token0, dst.token1].includes(ALLUSDC) || ![dst.token0, dst.token1].includes(pair.denom))
+      throw new Error(`pool ${pair.to} denoms are not ${pair.sym}/allUSDC; refusing`);
+    const sqc = Number(dst.current_sqrt_price), sqt = Number(src.current_sqrt_price);
+    const L = Number(dst.current_tick_liquidity);
+    if (!(L > 0)) throw new Error("destination has no in-range liquidity; add the full-range LP first");
+    const divBefore = divergencePct(src.current_sqrt_price, dst.current_sqrt_price);
+    if (divBefore < 0.05) throw new Error(`already aligned (${divBefore.toFixed(3)}%)`);
+
+    const up = sqt > sqc;   // price = token1 per token0; pushing it up consumes token1
+    const delta = up ? L * (sqt - sqc) : L * (1 / sqt - 1 / sqc);
+    const inDenom = up ? dst.token1 : dst.token0;
+    const outDenom = up ? dst.token0 : dst.token1;
+    const inSym = inDenom === ALLUSDC ? "allUSDC" : pair.sym;
+    const inDec = inDenom === ALLUSDC ? 6 : pair.dec;
+    const gross = 1 / (1 - Number(dst.spread_factor) - 0.003);   // spread + taker-fee headroom
+    const amtIn = BigInt(Math.ceil(delta * gross));
+    if (amtIn <= 0n) throw new Error("computed trade size is zero");
+    const bal = await bankBalance(ADDR, inDenom);
+    if (bal < amtIn) throw new Error(`needs ${fmtUnits(amtIn.toString(), inDec)} ${inSym}, wallet has ${fmtUnits(bal.toString(), inDec)}`);
+
+    const routes = [{ poolId: String(pair.to), tokenOutDenom: outDenom }];
+    const mkMsg = minOut => Any("/osmosis.poolmanager.v1beta1.MsgSwapExactAmountIn",
+      MsgSwapExactAmountIn({ sender: ADDR, routes, tokenIn: { denom: inDenom, amount: amtIn.toString() }, tokenOutMinAmount: minOut }));
+    const sim = await simulateMsgs(ADDR, [mkMsg("1")]);
+    const simOut = swapOutOfSim(sim, outDenom);
+    const minOut = (simOut * (10000n - 150n)) / 10000n;
+
+    /* The analytic expectation for the OTHER side of this swap, from the same L. If the
+       simulation disagrees wildly, the pool state this sizing was computed from is stale
+       (a just-landed tx not yet visible on the read endpoint) - signing would double-move. */
+    const expectedOut = up ? L * (1 / sqc - 1 / sqt) : L * (sqt - sqc);
+    const simVsExpected = expectedOut > 0 ? Number(simOut) / expectedOut : NaN;
+    if (!(simVsExpected > 0.7 && simVsExpected < 1.3))
+      throw new Error(`simulation disagrees with the sizing by ${((simVsExpected - 1) * 100).toFixed(0)}%: the pool read is probably stale (a recent tx not yet visible). Wait a few seconds, refresh, and retry.`);
+
+    const ok = await confirmSheet({ title: `Align pool ${pair.to} to the source price`, rows: [
+      ["direction", up ? `price up: sell allUSDC into ${pair.sym}` : `price down: sell ${pair.sym} into allUSDC`],
+      ["in", `${fmtUnits(amtIn.toString(), inDec)} ${inSym}`],
+      ["simulated out", `${fmtUnits(simOut.toString(), outDenom === ALLUSDC ? 6 : pair.dec)} ${outDenom === ALLUSDC ? "allUSDC" : pair.sym}`],
+      ["divergence now", divBefore.toFixed(3) + "%"],
+      ["after (approx.)", "~0%; fees shift the landing point, refresh and repeat if needed"],
+    ], warn: "You are trading against this pool's old price to correct it, mostly against your own liquidity. The spread you pay accrues to the pool's LPs." });
+    if (!ok) return;
+
+    const hash = await signAndBroadcast(ADDR, [mkMsg(minOut.toString())]);
+    log(`align landed: ${hash}`);
+    await sleep(4000);   // other LCD nodes lag the confirming one by a block or two
+    await refreshRow(pair);
+  } catch (e) { log(`align ${pair.sym}: ${e.message}`); }
+  finally { btn.disabled = false; }
+}
+
+async function doRebalance(pair, btn) {
+  btn.disabled = true;
+  try {
+    /* Withdraw half the full-range position and redeploy it as a 10% band around the
+       INTENDED price (the source pool's), in one transaction: a failing create reverts
+       the withdraw with it. The withdrawn amounts come from simulating the withdraw. */
+    const { fr } = await poolPositions(ADDR, pair.to);
+    if (!fr) throw new Error("no full-range position in this pool");
+    const [dst, src] = await Promise.all([clPool(pair.to), clPool(pair.from)]);
+    if (dst.spread_factor !== pair.spread) throw new Error(`pool ${pair.to} spread ${dst.spread_factor} does not match expected ${pair.spread}; refusing`);
+    if (String(dst.tick_spacing) !== TICK_SPACING) throw new Error(`pool ${pair.to} tick spacing is not ${TICK_SPACING}; refusing`);
+
+    const target = Number(src.current_sqrt_price) ** 2;
+    const lower = snapDown(priceToTick(target * 0.9));
+    const upper = snapUp(priceToTick(target * 1.1));
+    if (lower >= upper) throw new Error("computed band is empty");
+    const current = Number(dst.current_sqrt_price) ** 2;
+    const outsideBand = current < target * 0.9 || current > target * 1.1;
+
+    const halfAtomics = decAtomics(fr.liquidity) / 2n;
+    if (halfAtomics <= 0n) throw new Error("position has no liquidity");
+    const withdrawMsg = Any("/osmosis.concentratedliquidity.v1beta1.MsgWithdrawPosition",
+      MsgWithdrawPosition({ positionId: fr.id, sender: ADDR, liquidityAtomics: halfAtomics.toString() }));
+
+    log("simulating the withdraw to size the redeploy...");
+    const sim = await simulateMsgs(ADDR, [withdrawMsg]);
+    const { amount0, amount1 } = withdrawOutOfSim(sim);
+    const coins = [
+      { denom: dst.token0, amount: amount0.toString() },
+      { denom: dst.token1, amount: amount1.toString() },
+    ].filter(c => BigInt(c.amount) > 0n).sort((a, b) => a.denom.localeCompare(b.denom));
+    if (!coins.length) throw new Error("withdraw simulation returned nothing to redeploy");
+
+    const createMsg = Any("/osmosis.concentratedliquidity.v1beta1.MsgCreatePosition",
+      MsgCreatePosition({ poolId: String(pair.to), sender: ADDR, lowerTick: lower, upperTick: upper,
+        tokensProvided: coins, tokenMinAmount0: "0", tokenMinAmount1: "0" }));
+
+    const ok = await confirmSheet({ title: `Rebalance pool ${pair.to}: half FR into a 10% band`, rows: [
+      ["withdraw", `half of position #${fr.id}`],
+      ["yields (simulated)", coins.map(c => `${fmtUnits(c.amount, c.denom === ALLUSDC ? 6 : pair.dec)} ${c.denom === ALLUSDC ? "allUSDC" : pair.sym}`).join(" + ")],
+      ["redeploy band", `ticks ${lower} .. ${upper} (10% around the source price)`],
+      ["atomic", "one tx: if the create fails, the withdraw reverts with it"],
+    ], warn: outsideBand
+      ? "The destination's CURRENT price is outside the new band, so the redeployed position starts single-sided and whatever does not fit stays in the wallet. Align the price first for a balanced deposit."
+      : undefined });
+    if (!ok) return;
+
+    const hash = await signAndBroadcast(ADDR, [withdrawMsg, createMsg]);
+    log(`rebalance landed in ${pair.to}: ${hash}`);
+    await sleep(4000);   // other LCD nodes lag the confirming one by a block or two
+    await refreshRow(pair);
+  } catch (e) { log(`rebalance ${pair.sym}: ${e.message}`); }
+  finally { btn.disabled = false; }
+}
+
+/* ---------------- UI ---------------- */
+function rowHtml(pair) {
+  return `<tr id="row-${pair.to}">
+    <td><a class="dim" href="https://app.osmosis.zone/pool/${pair.to}" target="_blank" rel="noopener">${pair.to}</a></td>
+    <td>${esc(pair.sym)}/allUSDC</td>
+    <td class="num dim">${Number(pair.spread) * 100}%</td>
+    <td class="num" id="div-${pair.to}">…</td>
+    <td><input type="checkbox" id="fr-${pair.to}" disabled title="you hold a full-range position in this pool"></td>
+    <td><input type="checkbox" id="nr-${pair.to}" disabled title="you hold a narrower (concentrated) position in this pool"></td>
+    <td class="num" id="bal-${pair.to}">…</td>
+    <td class="num" id="usdc-${pair.to}">…</td>
+    <td><button id="swap-${pair.to}" disabled>Swap $50</button></td>
+    <td><button id="lp-${pair.to}" disabled>Add full-range LP</button></td>
+    <td><button id="align-${pair.to}" disabled>Align</button></td>
+    <td><button id="rebal-${pair.to}" disabled title="withdraw half the full-range position, redeploy in a 10% band around the source price">Rebal &#189;</button></td>
+  </tr>`;
+}
+async function refreshRow(pair) {
+  try {
+    const [src, dst] = await Promise.all([clPool(pair.from), clPool(pair.to)]);
+    const div = divergencePct(src.current_sqrt_price, dst.current_sqrt_price);
+    const el = $(`div-${pair.to}`);
+    el.textContent = isNaN(div) ? "n/a" : div.toFixed(3) + "%";
+    el.className = "num " + (div < 0.1 ? "ok" : "bad");
+    el.title = div < 0.1 ? "inside the 0.1% migration gate" : "outside the 0.1% migration gate";
+  } catch (e) { $(`div-${pair.to}`).textContent = "err"; log(`pool ${pair.to}: ${e.message}`); }
+  if (ADDR) {
+    try {
+      const [a, u, pos] = await Promise.all([bankBalance(ADDR, pair.denom), bankBalance(ADDR, ALLUSDC), poolPositions(ADDR, pair.to)]);
+      $(`fr-${pair.to}`).checked = !!pos.fr;
+      $(`nr-${pair.to}`).checked = pos.narrow;
+      $(`align-${pair.to}`).disabled = false;
+      $(`rebal-${pair.to}`).disabled = !pos.fr;
+      $(`bal-${pair.to}`).textContent = fmtUnits(a.toString(), pair.dec) + " " + pair.sym;
+      $(`usdc-${pair.to}`).textContent = fmtUnits(u.toString(), 6);
+      $(`swap-${pair.to}`).disabled = false;
+      $(`lp-${pair.to}`).disabled = a === 0n;
+    } catch (e) { log(`balances ${pair.sym}: ${e.message}`); }
+  }
+}
+async function refreshAll() {
+  for (const pair of PAIRS) await refreshRow(pair);   // sequential: gentle on public LCDs
+}
+$("rows").innerHTML = PAIRS.map(rowHtml).join("");
+for (const pair of PAIRS) {
+  $(`swap-${pair.to}`).onclick = e => doSwap(pair, e.target);
+  $(`lp-${pair.to}`).onclick = e => doAddLp(pair, e.target);
+  $(`align-${pair.to}`).onclick = e => doAlign(pair, e.target);
+  $(`rebal-${pair.to}`).onclick = e => doRebalance(pair, e.target);
+}
+$("connect").onclick = async () => {
+  try {
+    if (!window.keplr) throw new Error("Keplr not found");
+    await window.keplr.enable(CHAIN_ID);
+    const k = await window.keplr.getKey(CHAIN_ID);
+    ADDR = k.bech32Address;
+    $("who").textContent = ADDR;
+    $("refresh").disabled = false;
+    log(`connected ${ADDR}`);
+    await refreshAll();
+  } catch (e) { log("connect: " + e.message); }
+};
+$("refresh").onclick = () => refreshAll();
+refreshAll();   // divergence is visible before connecting
+</script>
+</body>
+</html>
