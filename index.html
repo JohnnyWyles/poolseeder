@@ -84,6 +84,9 @@ const PAIRS = [
   { from: 2321, to: 3504, sym: "BTC", dec: 8, spread: "0.001000000000000000", denom: "factory/osmo1z6r6qdknhgsc0zeracktgpcxf43j6sekq07nw8sxduc9lg0qjjlqfu25e3/alloyed/allBTC" },
   { from: 1251, to: 3505, sym: "ATOM", dec: 6, spread: "0.002000000000000000", denom: "ibc/27394FB092D2ECCD56123C74F36E4C1F926001CEADA9CA97EA622B25F41E5EB2" },
   { from: 1880, to: 3508, sym: "USDT", dec: 6, spread: "0.000500000000000000", denom: "factory/osmo1em6xs47hd82806f5cxgyufguxrrc7l0aqx7nzzptjuqgswczk8csavdxek/alloyed/allUSDT" },
+  // Proposal 1042 sends the 1880 static position (9903577) to 3507, the 0.0001 tier, not the
+  // spread-matched 3508. Listed so that destination can be aligned before the redeposit.
+  { from: 1880, to: 3507, sym: "USDT", dec: 6, spread: "0.000100000000000000", denom: "factory/osmo1em6xs47hd82806f5cxgyufguxrrc7l0aqx7nzzptjuqgswczk8csavdxek/alloyed/allUSDT" },
   { from: 1301, to: 3509, sym: "AKT", dec: 6, spread: "0.002000000000000000", denom: "ibc/1480B8FD20AD5FCAE81EA87584D269547DD4D436843C1D20F15E00EB64743EF4" },
   { from: 1220, to: 3510, sym: "USDT.kava", dec: 6, spread: "0.000100000000000000", denom: "ibc/4ABBEF4C8926DDDB320AE5188CFD63267ABBCEFC0583E4AE05D6E5AA2401DDAB" },
   { from: 1947, to: 3511, via: 1948, sym: "ETH", dec: 18, spread: "0.002000000000000000", denom: "factory/osmo1k6c8jln7ejuqwtqmay3yvzrg3kueaczl96pk067ldg8u835w0yhsw27twm/alloyed/allETH" },
