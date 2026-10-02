@@ -41,13 +41,13 @@ const arrow = name => { const m = new RegExp(`^const ${name}\\s*=`, "m").exec(HT
 
 const FNS = ["uint64Value", "varint", "cat", "tag", "bytesF", "strF", "u64F", "i64F",
              "SwapAmountInRoute", "MsgSwapExactAmountIn", "MsgCreatePosition", "MsgWithdrawPosition",
-             "priceToTick", "decAtomics", "fmtUnits", "divergencePct"];
+             "priceToTick", "tickToPrice", "positionStatus", "decAtomics", "fmtUnits", "divergencePct"];
 const src = [
   "const te = new TextEncoder();",
   "const MIN_TICK = -108000000n, MAX_TICK = 342000000n;",
-  arrow("U64_MAX"), arrow("Any"), arrow("Coin"), arrow("snapDown"), arrow("snapUp"),
+  arrow("U64_MAX"), arrow("Any"), arrow("Coin"), arrow("snapDown"), arrow("snapUp"), arrow("sig4"),
   ...FNS.map(fn),
-  `return { ${FNS.join(", ")}, Coin: Coin, Any: Any };`,
+  `return { ${FNS.join(", ")}, Coin: Coin, Any: Any, sig4: sig4 };`,
 ].join("\n");
 const T = new Function(src)();
 
@@ -143,6 +143,28 @@ checkEq("priceToTick 10", T.priceToTick(10), 9000000);
 checkEq("priceToTick 0.1", T.priceToTick(0.1), -9000000);
 checkEq("decAtomics", T.decAtomics("1234.567890123456789012").toString(), "1234567890123456789012");
 checkEq("decAtomics whole", T.decAtomics("7").toString(), "7000000000000000000");
+
+/* --- tickToPrice inverts priceToTick (the narrow-range status reads position ticks back as prices) --- */
+for (const t of [0, 9000000, -9000000, -107862100, 1234500, -54321000]) {
+  checkEq(`tick round-trip ${t}`, T.priceToTick(T.tickToPrice(t)), t);
+}
+checkEq("tickToPrice 3501", Math.abs(T.tickToPrice(-107862100) / 1.1379e-12 - 1) < 1e-9, true);
+
+/* --- position status follows the frontend's calcPositionStatus (15% of width = near bounds) --- */
+checkEq("status centre", T.positionStatus(90, 110, 100), "inRange");
+checkEq("status near lower", T.positionStatus(90, 110, 92), "nearBounds");
+checkEq("status at 15% edge", T.positionStatus(90, 110, 93), "nearBounds");
+checkEq("status just inside 15%", T.positionStatus(90, 110, 93.1), "inRange");
+checkEq("status on bound is out", T.positionStatus(90, 110, 110), "outOfRange");
+checkEq("status above", T.positionStatus(90, 110, 120), "outOfRange");
+checkEq("status NaN price", T.positionStatus(90, 110, NaN), "outOfRange");
+
+/* --- 4 significant figures for the asset holding; whole digits are never dropped --- */
+checkEq("sig4 small", T.sig4("0.588693"), "0.5887");
+checkEq("sig4 18-dec", T.sig4("0.010527099865870749"), "0.01053");
+checkEq("sig4 thousands", T.sig4("6,282.942645"), "6,283");
+checkEq("sig4 keeps whole digits", T.sig4("39,010.642019"), "39,011");
+checkEq("sig4 zero", T.sig4("0"), "0");
 
 /* --- helpers --- */
 checkEq("fmtUnits 18-dec", T.fmtUnits("123456789012345678", 18), "0.123456789012345678");
