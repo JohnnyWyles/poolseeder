@@ -583,59 +583,92 @@ async function doAddLp(pair, btn) {
 async function doAlign(pair, btn) {
   btn.disabled = true;
   try {
-    /* Move the destination pool's price onto the source's with one swap inside the
-       destination. The trade size comes from the pool's in-range liquidity L:
-       pushing the price up consumes token1 (allUSDC), dy = L*(sqrtTarget - sqrtCurrent);
-       pushing it down consumes token0 (the asset), dx = L*(1/sqrtTarget - 1/sqrtCurrent).
-       The input is grossed up for the spread (taken from tokenIn before the swap math),
-       so the landing point is approximate: refresh and repeat if a residual remains. */
+    /* Close the divergence by trading in whichever pool is SHALLOWER (by USD liquidity,
+       read fresh): it takes the least capital to move, and the deeper pool's price is the
+       better reference. The moved pool is pushed onto the other's price with one swap,
+       sized from its in-range liquidity L: pushing the price up consumes token1,
+       dy = L*(sqrtTarget - sqrtCurrent); pushing it down consumes token0,
+       dx = L*(1/sqrtTarget - 1/sqrtCurrent). The input is grossed up for the spread and
+       the hop's directional taker fee, so the landing point is approximate: refresh and
+       repeat if a residual remains.
+       When the origin (asset/USDC.noble) is the shallower pool the trade still runs from
+       and to allUSDC: the route adds the allUSDC <-> USDC.noble transmuter hop (pool 3497,
+       1:1, no spread or taker fee) in the same transaction. */
     const [dst, src] = await Promise.all([clPool(pair.to), clPool(pair.from)]);
     if (![dst.token0, dst.token1].includes(ALLUSDC) || ![dst.token0, dst.token1].includes(pair.denom))
       throw new Error(`pool ${pair.to} denoms are not ${pair.sym}/allUSDC; refusing`);
-    const sqc = Number(dst.current_sqrt_price), sqt = Number(src.current_sqrt_price);
-    const L = Number(dst.current_tick_liquidity);
-    if (!(L > 0)) throw new Error("destination has no in-range liquidity; add the full-range LP first");
-    const divBefore = divergencePct(src.current_sqrt_price, dst.current_sqrt_price);
-    if (divBefore < 0.05) throw new Error(`already aligned (${divBefore.toFixed(3)}%)`);
+    if (![src.token0, src.token1].includes(USDC_NOBLE) || ![src.token0, src.token1].includes(pair.denom))
+      throw new Error(`pool ${pair.from} denoms are not ${pair.sym}/USDC.noble; refusing`);
+    /* each pool's price as raw USDC per raw asset, whichever way round its tokens sit */
+    const assetPrice = p => { const q = Number(p.current_sqrt_price) ** 2; return p.token0 === pair.denom ? q : 1 / q; };
+    const srcPrice = assetPrice(src), dstPrice = assetPrice(dst);
+    const divBefore = Math.abs(dstPrice - srcPrice) / srcPrice * 100;
+    if (!(divBefore >= 0.05)) throw new Error(`already aligned (${divBefore.toFixed(3)}%)`);
+
+    const srcUsd = await poolLiquidityUsd(pair.from, pair, srcPrice);
+    const dstUsd = await poolLiquidityUsd(pair.to, pair, srcPrice);
+    if (!(srcUsd > 0 && dstUsd > 0)) throw new Error("could not value both pools' liquidity");
+    const moveSrc = srcUsd < dstUsd;
+    const mv = moveSrc ? src : dst, mvId = String(moveSrc ? pair.from : pair.to);
+    const mvUsdc = moveSrc ? USDC_NOBLE : ALLUSDC;
+    const refPrice = moveSrc ? dstPrice : srcPrice;           // the deeper pool's price is the target
+
+    const sqc = Number(mv.current_sqrt_price);
+    const sqt = Math.sqrt(mv.token0 === pair.denom ? refPrice : 1 / refPrice);   // target in mv's own orientation
+    const L = Number(mv.current_tick_liquidity);
+    if (!(L > 0)) throw new Error(`pool ${mvId} has no in-range liquidity${moveSrc ? "" : "; add the full-range LP first"}`);
 
     const up = sqt > sqc;   // price = token1 per token0; pushing it up consumes token1
     const delta = up ? L * (sqt - sqc) : L * (1 / sqt - 1 / sqc);
-    const inDenom = up ? dst.token1 : dst.token0;
-    const outDenom = up ? dst.token0 : dst.token1;
-    const inSym = inDenom === ALLUSDC ? "allUSDC" : pair.sym;
-    const inDec = inDenom === ALLUSDC ? 6 : pair.dec;
-    const gross = 1 / (1 - Number(dst.spread_factor) - 0.003);   // spread + taker-fee headroom
+    const hopIn = up ? mv.token1 : mv.token0, hopOut = up ? mv.token0 : mv.token1;
+    const taker = await takerFee(hopIn, hopOut);
+    const gross = 1 / (1 - Number(mv.spread_factor) - taker - 0.0005);   // spread + this hop's taker fee + headroom
     const amtIn = BigInt(Math.ceil(delta * gross));
     if (amtIn <= 0n) throw new Error("computed trade size is zero");
-    const bal = await bankBalance(ADDR, inDenom);
-    if (bal < amtIn) throw new Error(`needs ${fmtUnits(amtIn.toString(), inDec)} ${inSym}, wallet has ${fmtUnits(bal.toString(), inDec)}`);
 
-    const routes = [{ poolId: String(pair.to), tokenOutDenom: outDenom }];
+    /* wallet side: allUSDC stands in for USDC.noble through the 1:1 transmuter */
+    const routes = [];
+    if (hopIn === USDC_NOBLE) routes.push({ poolId: TRANSMUTER_POOL, tokenOutDenom: USDC_NOBLE });
+    routes.push({ poolId: mvId, tokenOutDenom: hopOut });
+    if (hopOut === USDC_NOBLE) routes.push({ poolId: TRANSMUTER_POOL, tokenOutDenom: ALLUSDC });
+    const inDenom = hopIn === USDC_NOBLE ? ALLUSDC : hopIn;
+    const outDenom = hopOut === USDC_NOBLE ? ALLUSDC : hopOut;
+    const label = d => d === ALLUSDC ? "allUSDC" : pair.sym, decOf = d => d === ALLUSDC ? 6 : pair.dec;
+    const bal = await bankBalance(ADDR, inDenom);
+    if (bal < amtIn) throw new Error(`needs ${fmtUnits(amtIn.toString(), decOf(inDenom))} ${label(inDenom)}, wallet has ${fmtUnits(bal.toString(), decOf(inDenom))}`);
+
     const mkMsg = minOut => Any("/osmosis.poolmanager.v1beta1.MsgSwapExactAmountIn",
       MsgSwapExactAmountIn({ sender: ADDR, routes, tokenIn: { denom: inDenom, amount: amtIn.toString() }, tokenOutMinAmount: minOut }));
     const sim = await simulateMsgs(ADDR, [mkMsg("1")]);
     const simOut = swapOutOfSim(sim, outDenom);
     const minOut = (simOut * (10000n - 150n)) / 10000n;
 
-    /* The analytic expectation for the OTHER side of this swap, from the same L. If the
-       simulation disagrees wildly, the pool state this sizing was computed from is stale
-       (a just-landed tx not yet visible on the read endpoint) - signing would double-move. */
+    /* The analytic expectation for the OTHER side of the moved pool's swap, from the same L
+       (the transmuter hop is 1:1). If the simulation disagrees wildly, the pool state this
+       sizing was computed from is stale (a just-landed tx not yet visible on the read
+       endpoint) - signing would double-move. */
     const expectedOut = up ? L * (1 / sqc - 1 / sqt) : L * (sqc - sqt);   // token0 out going up, token1 out going down
     const simVsExpected = expectedOut > 0 ? Number(simOut) / expectedOut : NaN;
     if (!(simVsExpected > 0.7 && simVsExpected < 1.3))
       throw new Error(`simulation disagrees with the sizing by ${((simVsExpected - 1) * 100).toFixed(0)}%: the pool read is probably stale (a recent tx not yet visible). Wait a few seconds, refresh, and retry.`);
 
-    const ok = await confirmSheet({ title: `Align pool ${pair.to} to the source price`, rows: [
-      ["direction", up ? `price up: sell allUSDC into ${pair.sym}` : `price down: sell ${pair.sym} into allUSDC`],
-      ["in", `${fmtUnits(amtIn.toString(), inDec)} ${inSym}`],
-      ["simulated out", `${fmtUnits(simOut.toString(), outDenom === ALLUSDC ? 6 : pair.dec)} ${outDenom === ALLUSDC ? "allUSDC" : pair.sym}`],
+    const assetUp = (mv.token0 === pair.denom) === up;   // is the asset getting dearer in the moved pool?
+    const ok = await confirmSheet({ title: `Align pool ${mvId} to pool ${moveSrc ? pair.to : pair.from}`, rows: [
+      ["pool traded", `${mvId} (${moveSrc ? "origin" : "destination"}): the shallower, ${fmtUsdInt(Math.min(srcUsd, dstUsd))} vs ${fmtUsdInt(Math.max(srcUsd, dstUsd))}`],
+      ["direction", assetUp ? `${pair.sym} up: sell allUSDC into ${pair.sym}` : `${pair.sym} down: sell ${pair.sym} into allUSDC`],
+      ["route", routes.map(r => r.poolId).join(" → ") + (routes.length > 1 ? " (3497 is the 1:1 allUSDC/USDC.noble transmuter)" : "")],
+      ["in", `${fmtUnits(amtIn.toString(), decOf(inDenom))} ${label(inDenom)}`],
+      ["simulated out", `${fmtUnits(simOut.toString(), decOf(outDenom))} ${label(outDenom)}`],
+      ["fees on the moved hop", `spread ${pctOf(mv.spread_factor)} + taker ${pctOf(taker)}`],
       ["divergence now", divBefore.toFixed(3) + "%"],
       ["after (approx.)", "~0%; fees shift the landing point, refresh and repeat if needed"],
-    ], warn: "You are trading against this pool's old price to correct it, mostly against your own liquidity. The spread you pay accrues to the pool's LPs." });
+    ], warn: moveSrc
+      ? "You are trading in the origin pool, against its existing LPs, to bring its price onto the deeper allUSDC pool's. The spread you pay accrues to those LPs."
+      : "You are trading against the destination's old price to correct it, mostly against your own liquidity. The spread you pay accrues to the pool's LPs." });
     if (!ok) return;
 
     const hash = await signAndBroadcast(ADDR, [mkMsg(minOut.toString())]);
-    log(`align landed: ${hash}`);
+    log(`align landed in ${mvId}: ${hash}`);
     await afterTx(pair);
   } catch (e) { log(`align ${pair.sym}: ${e.message}`); }
   finally { btn.disabled = false; }

@@ -26,9 +26,12 @@ spot price) it offers these actions, each behind a confirmation sheet:
   arb would pay, read from the chain), so arbitrage will never close it; red past
   the band. **Align amber / Align red** in the header sweep those rows one pool at
   a time, each through its own confirmation (Cancel skips; click again to stop).
-- **Divergence** (click): re-reads the row, then runs one swap inside the destination pool that moves its price onto
-  the source pool's, sized from the destination's in-range liquidity
-  (`dy = L·Δ√P` up, `dx = L·Δ(1/√P)` down) and grossed up for the spread.
+- **Divergence** (click): re-reads the row, then runs one swap in whichever of the two pools is
+  shallower (by USD liquidity), moving its price onto the deeper pool's. When that is the origin
+  (asset/USDC.noble) pool, the route adds the 1:1 allUSDC/USDC.noble transmuter hop (3497), so the
+  trade still starts and ends in allUSDC. Sized from the moved pool's in-range liquidity
+  (`dy = L·Δ√P` up, `dx = L·Δ(1/√P)` down) and grossed up for the spread and that hop's
+  directional taker fee.
   Full-range LP adds depth but never moves price, so this is the step that
   actually closes a divergence; fees make the landing approximate, so refresh
   and repeat if a residual remains.
